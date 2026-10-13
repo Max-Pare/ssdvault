@@ -1,0 +1,606 @@
+#!/usr/bin/env bash
+# SSDVault (Linux) - versioned, encrypted backup of a portable SSD to the local disk of
+# every PC it gets plugged into. Arch, Debian or any other systemd distro.
+#
+# Ground rules:
+#   - Data flows one way: drive -> local repository. Nothing is ever restored, synced back
+#     or deleted on the drive automatically.
+#   - Nothing found on the drive is executed; the marker files are validated as data.
+#   - No network: the repository is a local directory, restic never leaves this machine.
+set -euo pipefail
+umask 077
+
+CONF_DIR=${SSDVAULT_CONF_DIR:-/etc/ssdvault}
+LIB_DIR=${SSDVAULT_LIB_DIR:-/var/lib/ssdvault}
+RUN_DIR=${SSDVAULT_RUN_DIR:-/run/ssdvault}
+export RESTIC_CACHE_DIR=${SSDVAULT_CACHE_DIR:-/var/cache/ssdvault}
+STATE_DIR=$LIB_DIR/state
+BIN=/usr/local/bin/ssdvault
+UNIT_DIR=/etc/systemd/system
+UDEV_RULE=/etc/udev/rules.d/99-ssdvault.rules
+
+MARKER=.ssdvault
+KEEP=(--keep-within 2d --keep-daily 14 --keep-weekly 8 --keep-monthly 24 --keep-yearly 5)
+PRUNE_EVERY=$((24 * 3600))
+CHECK_EVERY=$((7 * 24 * 3600))
+PLUG_WAIT=60
+FS_TYPES=exfat,vfat,ntfs,ntfs3,fuseblk,ext4,ext3,ext2,btrfs,xfs,f2fs
+
+# Overridden by $CONF_DIR/ssdvault.conf, which `ssdvault install` writes.
+RESTIC=restic
+REPO_ROOT=$LIB_DIR/repos
+# shellcheck source=/dev/null
+if [ -r "$CONF_DIR/ssdvault.conf" ]; then . "$CONF_DIR/ssdvault.conf"; fi
+
+usage() {
+  cat <<'EOF'
+SSDVault - versioned, encrypted backup of a portable SSD to this PC's local disk.
+
+  ssdvault install   [--repo-root DIR]      set up the udev/systemd triggers (once per PC)
+  ssdvault register  MOUNTPOINT [--name N]  mark the drive (first time only) and create
+                                            its repository on this PC
+  ssdvault run       [--path MOUNTPOINT]    back up the connected drives now
+  ssdvault status                           last backups, connected drives, repo sizes
+  ssdvault log                              recent backup log
+  ssdvault restic    VAULT RESTIC-ARGS...   run restic on a vault's repository
+                                            (snapshots, ls, diff, restore, mount, ...)
+  ssdvault stop                             abort the running backups
+  ssdvault uninstall                        remove the triggers; repositories are kept
+
+Every command needs root.
+EOF
+}
+
+DEFAULT_EXCLUDES='# SSDVault exclude patterns (restic syntax), used by every PC this drive visits.
+# A pattern without a leading slash matches that name at any depth.
+# To skip a single folder without editing this file, put an empty file named
+# .nobackup inside it. Folders containing a CACHEDIR.TAG file are skipped too.
+
+# Node / Next / React: rebuilt from package.json + the lockfile
+node_modules
+.next
+.nuxt
+.svelte-kit
+.turbo
+.parcel-cache
+.vite
+.vercel
+.expo
+.angular
+
+# Python
+__pycache__
+.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Blender: numbered save versions (the snapshots replace them) and half-written saves
+*.blend[0-9]
+*.blend[0-9][0-9]
+*.blend@
+
+# Operating system clutter
+?RECYCLE.BIN
+System Volume Information
+.Trash-*
+.Spotlight-V100
+.fseventsd
+Thumbs.db
+desktop.ini
+.DS_Store'
+
+DRIVE_README='This folder marks the drive for SSDVault, a backup tool.
+
+  id            identity of this drive. Do not edit it or copy it to another drive.
+  name          short name used for the backup folders on each PC
+  excludes.txt  what NOT to back up. Edit freely; every PC uses it.
+  history.log   which PC backed this drive up, and when
+
+Deleting this folder stops the automatic backups on every PC.'
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || [ -n "${SSDVAULT_TEST:-}" ] || die "run as root (sudo ssdvault ...)"; }
+now() { date +%s; }
+
+# Prints the vault id stored on the drive mounted at $1, or fails if there is none.
+# The file comes from removable media, so it is validated strictly before it is used in paths.
+read_vault_id() {
+  local f=$1/$MARKER/id id
+  [ -f "$f" ] && [ "$(stat -c %s "$f" 2>/dev/null || echo 999)" -le 200 ] || return 1
+  id=$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]' | tr 'A-F' 'a-f') || return 1
+  [[ $id =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$id"
+}
+
+sanitize_name() {
+  local n
+  n=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | cut -c1-40)
+  n=${n#"${n%%[!.-]*}"}
+  n=${n%"${n##*[!.-]}"}
+  printf '%s' "${n:-ssd}"
+}
+
+kv_get() {  # FILE KEY -> value, empty when missing. Never sourced: values may come from the drive.
+  local k v
+  [ -f "$1" ] || return 0
+  while IFS='=' read -r k v; do
+    if [ "$k" = "$2" ]; then printf '%s' "$v"; return 0; fi
+  done < "$1"
+}
+
+kv_set() {  # FILE KEY VALUE
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX")
+  if [ -f "$1" ]; then grep -v "^$2=" "$1" > "$tmp" || true; fi
+  printf '%s=%s\n' "$2" "$3" >> "$tmp"
+  mv -f "$tmp" "$1"
+}
+
+vault_conf() { printf '%s/vaults/%s.conf' "$CONF_DIR" "$1"; }
+
+use_vault() {
+  export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
+  RESTIC_REPOSITORY=$(kv_get "$(vault_conf "$1")" REPO)
+  RESTIC_PASSWORD_FILE=$CONF_DIR/keys/$1.pass
+}
+
+resolve_vault() {  # NAME or ID-PREFIX -> id
+  local f id hit=''
+  for f in "$CONF_DIR"/vaults/*.conf; do
+    [ -e "$f" ] || break
+    id=$(basename "$f" .conf)
+    if [ "$1" = "$(kv_get "$f" NAME)" ] || [[ ${#1} -ge 4 && $id == "$1"* ]]; then
+      [ -z "$hit" ] || die "'$1' matches more than one vault; use more of the id"
+      hit=$id
+    fi
+  done
+  [ -n "$hit" ] || die "no vault called '$1' on this PC (see: ssdvault status)"
+  printf '%s' "$hit"
+}
+
+RESTIC_VER=
+restic_at_least() {  # MAJOR MINOR
+  [ -n "$RESTIC_VER" ] || RESTIC_VER=$("$RESTIC" version 2>/dev/null | awk '{print $2; exit}')
+  local maj=${RESTIC_VER%%.*} rest=${RESTIC_VER#*.} min
+  min=${rest%%.*}
+  [[ $maj =~ ^[0-9]+$ && $min =~ ^[0-9]+$ ]] || return 1
+  [ "$maj" -gt "$1" ] || { [ "$maj" -eq "$1" ] && [ "$min" -ge "$2" ]; }
+}
+
+local_mounts() {  # mountpoints of local filesystems, one per line
+  local t
+  findmnt -rn -o TARGET -t "$FS_TYPES" 2>/dev/null | while IFS= read -r t; do printf '%b\n' "$t"; done
+}
+
+mount_of() {  # DEVICE -> its first mountpoint, if any
+  local t
+  t=$(findmnt -rn -o TARGET --source "$1" 2>/dev/null | head -n1) || true
+  if [ -n "$t" ]; then printf '%b' "$t"; fi
+}
+
+wait_for_mount() {  # DEVICE -> mountpoint, once the desktop (or fstab) has mounted it
+  local i m
+  for ((i = 0; i < PLUG_WAIT; i += 2)); do
+    m=$(mount_of "$1")
+    if [ -n "$m" ]; then printf '%s' "$m"; return 0; fi
+    [ -b "$1" ] || return 0
+    sleep 2
+  done
+}
+
+notify() {  # TITLE BODY - best effort, to every logged-in desktop session
+  command -v notify-send >/dev/null 2>&1 || return 0
+  local bus uid user
+  if [ "$(id -u)" -ne 0 ]; then
+    notify-send -a SSDVault "$1" "$2" >/dev/null 2>&1 || true
+    return 0
+  fi
+  for bus in /run/user/*/bus; do
+    [ -S "$bus" ] || continue
+    uid=${bus#/run/user/}
+    uid=${uid%/bus}
+    [ "$uid" -ge 1000 ] 2>/dev/null || continue
+    user=$(id -nu "$uid" 2>/dev/null) || continue
+    runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" \
+      notify-send -a SSDVault "$1" "$2" >/dev/null 2>&1 || true
+  done
+}
+
+maintenance() {  # ID NAME - repository env already set; runs after a good backup
+  local state=$STATE_DIR/$1.state out=$RUN_DIR/$1.out t last
+  t=$(now)
+  last=$(kv_get "$state" LAST_PRUNE)
+  if [ $((t - ${last:-0})) -ge $PRUNE_EVERY ]; then
+    log "$2: applying the retention policy"
+    if "$RESTIC" forget --tag ssdvault --group-by host "${KEEP[@]}" --prune > "$out" 2>&1; then
+      kv_set "$state" LAST_PRUNE "$t"
+    else
+      tail -n 5 "$out"
+      notify "SSDVault: $2" "Removing old snapshots failed. See: sudo ssdvault log"
+    fi
+  fi
+  last=$(kv_get "$state" LAST_CHECK)
+  if [ $((t - ${last:-0})) -ge $CHECK_EVERY ]; then
+    log "$2: verifying the repository (structure + 2% of the data)"
+    kv_set "$state" LAST_CHECK "$t"
+    if "$RESTIC" check --read-data-subset 2% > "$out" 2>&1; then
+      kv_set "$state" LAST_CHECK_RESULT ok
+    else
+      cat "$out"
+      kv_set "$state" LAST_CHECK_RESULT failed
+      notify "SSDVault: $2" "Repository check FAILED: the backups on this PC may be damaged. Run: sudo ssdvault restic $2 check"
+    fi
+  fi
+}
+
+backup_vault() {  # MOUNTPOINT REASON
+  local mnt=$1 reason=$2 id conf name state out t0 rc snap result secs min last what
+  id=$(read_vault_id "$mnt") || return 0
+  conf=$(vault_conf "$id")
+  if [ ! -f "$conf" ]; then
+    log "found an SSDVault drive at $mnt (id ${id:0:8}) that is not registered on this PC; run: sudo ssdvault register '$mnt'"
+    return 0
+  fi
+  name=$(kv_get "$conf" NAME)
+  state=$STATE_DIR/$id.state
+  out=$RUN_DIR/$id.out
+  mkdir -p "$STATE_DIR" "$RUN_DIR"
+
+  exec 9> "$RUN_DIR/$id.lock"
+  if ! flock -n 9; then
+    log "$name: a backup is already running"
+    exec 9>&-
+    return 0
+  fi
+
+  case $reason in plug) min=300 ;; timer) min=1500 ;; *) min=0 ;; esac
+  last=$(kv_get "$state" LAST_SUCCESS)
+  if [ $(($(now) - ${last:-0})) -lt "$min" ]; then
+    log "$name: last backup $(($(now) - last))s ago, skipping"
+    exec 9>&-
+    return 0
+  fi
+
+  use_vault "$id"
+  if [ "$reason" = plug ]; then
+    notify "SSDVault: $name" "Backup started. Wait for 'done' before unplugging."
+  fi
+  "$RESTIC" unlock > /dev/null 2>&1 || true
+
+  local args=(backup "$mnt" --tag ssdvault --exclude-caches --exclude-if-present .nobackup
+              --ignore-inode --exclude "$MARKER/history.log")
+  if [ -f "$mnt/$MARKER/excludes.txt" ]; then args+=(--exclude-file "$mnt/$MARKER/excludes.txt"); fi
+  if restic_at_least 0 17; then args+=(--skip-if-unchanged); fi
+
+  log "$name: backing up $mnt -> $RESTIC_REPOSITORY"
+  t0=$(now)
+  set +e
+  "$RESTIC" "${args[@]}" 2>&1 | tee "$out"
+  rc=${PIPESTATUS[0]}
+  set -e
+  secs=$(($(now) - t0))
+  snap=$(sed -n 's/^snapshot \([0-9a-f]\{8\}\) saved.*/\1/p' "$out" | tail -n1)
+
+  case $rc in
+    0) result=ok ;;
+    3) if read_vault_id "$mnt" > /dev/null; then result=warnings; else result=interrupted; fi ;;
+    *) result=failed ;;
+  esac
+  if [ "$result" = interrupted ] && [ -n "$snap" ]; then
+    log "$name: the drive went away during the backup; discarding incomplete snapshot $snap"
+    "$RESTIC" forget "$snap" > /dev/null 2>&1 || true
+    snap=
+  fi
+
+  kv_set "$state" LAST_ATTEMPT "$t0"
+  kv_set "$state" LAST_RESULT "$result"
+  case $result in
+    ok | warnings)
+      kv_set "$state" LAST_SUCCESS "$t0"
+      kv_set "$state" LAST_SNAPSHOT "${snap:-unchanged}"
+      kv_set "$state" LAST_ERROR "" ;;
+    *)
+      kv_set "$state" LAST_ERROR "$(tail -n 3 "$out" | tr '\n\t' '  ' | cut -c1-300)" ;;
+  esac
+
+  if [ "$result" != interrupted ] && [ -w "$mnt/$MARKER" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%ss\n' "$(date -Iseconds)" "$(uname -n)" linux "$result" "${snap:--}" "$secs" \
+      >> "$mnt/$MARKER/history.log" 2> /dev/null || true
+  fi
+
+  if [ -n "$snap" ]; then what="snapshot $snap"; elif [ "$rc" -eq 0 ]; then what="nothing changed"; else what="no snapshot"; fi
+  case $result in
+    ok) if [ "$reason" = plug ]; then notify "SSDVault: $name" "Backup done in ${secs}s ($what)."; fi ;;
+    warnings) notify "SSDVault: $name" "Backup done, but some files could not be read. See: sudo ssdvault log" ;;
+    interrupted) notify "SSDVault: $name" "The drive was removed during the backup; that run was discarded." ;;
+    failed) notify "SSDVault: $name" "Backup FAILED (restic exit $rc). See: sudo ssdvault log" ;;
+  esac
+  log "$name: $result in ${secs}s ($what)"
+
+  case $result in ok | warnings) maintenance "$id" "$name" ;; esac
+  exec 9>&-
+}
+
+cmd_run() {
+  need_root
+  local reason=manual device='' path='' m id uuid selfmnt='' found=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --reason) reason=${2:?}; shift 2 ;;
+      --device) device=${2:?}; shift 2 ;;
+      --path) path=${2:?}; shift 2 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  case $reason in manual | plug | timer) ;; *) die "bad --reason: $reason" ;; esac
+
+  if [ -n "$path" ]; then
+    read_vault_id "$path" > /dev/null || die "no SSDVault marker in $path"
+    backup_vault "$path" "$reason"
+    return 0
+  fi
+
+  if [ -n "$device" ]; then
+    # Plugged in: give the desktop time to mount it. If nobody does (no one logged in)
+    # and the filesystem belongs to a registered vault, mount it read-only ourselves.
+    m=$(wait_for_mount "$device")
+    if [ -z "$m" ] && [ -b "$device" ]; then
+      uuid=$(blkid -o value -s UUID "$device" 2> /dev/null || true)
+      if [ -n "$uuid" ] && grep -Fqx "FS_UUID=$uuid" "$CONF_DIR"/vaults/*.conf 2> /dev/null; then
+        selfmnt=$RUN_DIR/mnt-${device##*/}
+        mkdir -p "$selfmnt"
+        if mount -o ro,nosuid,nodev,noexec "$device" "$selfmnt"; then
+          m=$selfmnt
+          log "nobody mounted $device; mounted it read-only at $m"
+        else
+          rmdir "$selfmnt"
+          selfmnt=
+        fi
+      fi
+    fi
+    if [ -n "$m" ]; then backup_vault "$m" "$reason"; fi
+    if [ -n "$selfmnt" ]; then
+      umount "$selfmnt" || umount -l "$selfmnt"
+      rmdir "$selfmnt" 2> /dev/null || true
+    fi
+    return 0
+  fi
+
+  local -A seen=()
+  local mounts=()
+  mapfile -t mounts < <(local_mounts)
+  for m in "${mounts[@]}"; do
+    id=$(read_vault_id "$m") || continue
+    [ -z "${seen[$id]:-}" ] || continue
+    seen[$id]=1
+    found=1
+    backup_vault "$m" "$reason"
+  done
+  if [ "$found" = 0 ] && [ "$reason" = manual ]; then log "no SSDVault drive is mounted"; fi
+}
+
+cmd_register() {
+  need_root
+  local target='' name='' mdir id uuid conf key repo
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --name) name=${2:?}; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) target=$1; shift ;;
+    esac
+  done
+  [ -n "$target" ] || die "usage: ssdvault register MOUNTPOINT [--name NAME]"
+  [ -d "$target" ] || die "$target is not a directory"
+  command -v "$RESTIC" > /dev/null || die "restic not found; run: sudo ssdvault install"
+  target=$(cd "$target" && pwd -P)
+  mdir=$target/$MARKER
+  mkdir -p "$mdir"
+
+  if ! id=$(read_vault_id "$target"); then
+    [ ! -e "$mdir/id" ] || die "$mdir/id exists but is not a valid SSDVault id; refusing to overwrite it"
+    id=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    printf '%s\n' "$id" > "$mdir/id"
+    log "new vault id written to the drive: $id"
+  fi
+  if [ -n "$name" ]; then
+    name=$(sanitize_name "$name")
+    printf '%s\n' "$name" > "$mdir/name"
+  elif [ -f "$mdir/name" ]; then
+    name=$(sanitize_name "$(head -n1 "$mdir/name")")
+  else
+    name=$(findmnt -rn -o LABEL -M "$target" 2> /dev/null || true)
+    name=$(sanitize_name "$(printf '%b' "${name:-$(basename "$target")}")")
+    printf '%s\n' "$name" > "$mdir/name"
+  fi
+  [ -f "$mdir/excludes.txt" ] || printf '%s\n' "$DEFAULT_EXCLUDES" > "$mdir/excludes.txt"
+  [ -f "$mdir/README.txt" ] || printf '%s\n' "$DRIVE_README" > "$mdir/README.txt"
+
+  mkdir -p "$CONF_DIR/vaults" "$CONF_DIR/keys" "$STATE_DIR"
+  conf=$(vault_conf "$id")
+  key=$CONF_DIR/keys/$id.pass
+  if [ -f "$conf" ]; then
+    log "'$name' is already registered on this PC (repository $(kv_get "$conf" REPO))"
+    return 0
+  fi
+  repo=$REPO_ROOT/$name-${id:0:8}
+  if [ -f "$repo/config" ]; then
+    [ -f "$key" ] || die "$repo already exists but its password file is missing; put the password in $key and register again"
+    log "reusing the existing repository $repo"
+  else
+    [ -f "$key" ] || head -c 32 /dev/urandom | base64 | tr -d '\n' > "$key"
+    chmod 600 "$key"
+    mkdir -p "$REPO_ROOT"
+    RESTIC_REPOSITORY=$repo RESTIC_PASSWORD_FILE=$key "$RESTIC" init
+  fi
+  uuid=$(findmnt -rn -o UUID -M "$target" 2> /dev/null || true)
+  printf 'NAME=%s\nREPO=%s\nFS_UUID=%s\n' "$name" "$repo" "$uuid" > "$conf"
+  log "registered '$name' (id ${id:0:8}) -> $repo"
+  cat <<EOF
+
+Repository password: $key
+Save it in your password manager: without it, the backups on this PC cannot be read.
+First backup now:    sudo ssdvault run
+EOF
+}
+
+cmd_status() {
+  need_root
+  local f id name repo state last m any=0
+  local -A at=()
+  local mounts=()
+  mapfile -t mounts < <(local_mounts)
+  for m in "${mounts[@]}"; do
+    if id=$(read_vault_id "$m"); then at[$id]=$m; fi
+  done
+  for f in "$CONF_DIR"/vaults/*.conf; do
+    [ -e "$f" ] || break
+    any=1
+    id=$(basename "$f" .conf)
+    name=$(kv_get "$f" NAME)
+    repo=$(kv_get "$f" REPO)
+    state=$STATE_DIR/$id.state
+    echo "== $name (${id:0:8})"
+    echo "   repository : $repo ($(du -sh "$repo" 2> /dev/null | cut -f1))"
+    last=$(kv_get "$state" LAST_SUCCESS)
+    if [ -n "$last" ]; then
+      echo "   last backup: $(date -d "@$last" '+%F %T') ($(kv_get "$state" LAST_SNAPSHOT))"
+    else
+      echo "   last backup: never"
+    fi
+    echo "   last result: $(kv_get "$state" LAST_RESULT) $(kv_get "$state" LAST_ERROR)"
+    last=$(kv_get "$state" LAST_CHECK)
+    if [ -n "$last" ]; then echo "   last check : $(date -d "@$last" '+%F') $(kv_get "$state" LAST_CHECK_RESULT)"; fi
+    if [ -n "${at[$id]:-}" ]; then
+      echo "   drive      : connected at ${at[$id]}"
+      if [ -f "${at[$id]}/$MARKER/history.log" ]; then
+        echo "   latest backup of this drive on each PC (from the drive's history.log):"
+        tr -cd '[:print:]\t\n' < "${at[$id]}/$MARKER/history.log" \
+          | awk -F'\t' '{ last[$2] = $0 } END { for (h in last) print last[h] }' | sort \
+          | awk -F'\t' '{ printf "     %-25s %-20s %-8s %-11s %s\n", $1, $2, $3, $4, $5 }'
+      fi
+    else
+      echo "   drive      : not connected"
+    fi
+  done
+  [ "$any" = 1 ] || echo "No vault registered on this PC. Plug the drive in and run: sudo ssdvault register MOUNTPOINT"
+}
+
+cmd_restic() {
+  need_root
+  [ $# -ge 1 ] || die "usage: ssdvault restic VAULT RESTIC-ARGS..."
+  local id
+  id=$(resolve_vault "$1")
+  shift
+  use_vault "$id"
+  exec "$RESTIC" "$@"
+}
+
+pkg_hint() {
+  local os=
+  # shellcheck source=/dev/null
+  if [ -r /etc/os-release ]; then os=$(. /etc/os-release && printf '%s %s' "${ID:-}" "${ID_LIKE:-}"); fi
+  case $os in
+    *arch*) echo "Install it with: pacman -S restic" ;;
+    *debian* | *ubuntu*) echo "Install it with: apt install restic" ;;
+    *) echo "Install it from your package manager or https://github.com/restic/restic/releases" ;;
+  esac
+}
+
+write_unit() { cat > "$1"; chmod 0644 "$1"; }
+
+cmd_install() {
+  need_root
+  local repo_root=$REPO_ROOT restic_bin self d
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --repo-root) repo_root=${2:?}; shift 2 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+  done
+  case $repo_root in /*) ;; *) die "--repo-root must be an absolute path" ;; esac
+  restic_bin=$(command -v restic || true)
+  [ -n "$restic_bin" ] || die "restic is not installed. $(pkg_hint)"
+  for d in findmnt flock blkid runuser systemctl udevadm; do
+    command -v "$d" > /dev/null || die "$d is missing"
+  done
+
+  self=$(readlink -f "$0")
+  if [ "$self" != "$BIN" ]; then install -m 0755 "$self" "$BIN"; fi
+  for d in "$CONF_DIR" "$CONF_DIR/vaults" "$CONF_DIR/keys" "$LIB_DIR" "$STATE_DIR" "$repo_root"; do
+    [ -d "$d" ] || install -d -m 0700 "$d"
+  done
+  printf '# written by ssdvault install\nRESTIC=%q\nREPO_ROOT=%q\n' "$restic_bin" "$repo_root" > "$CONF_DIR/ssdvault.conf"
+
+  write_unit "$UNIT_DIR/ssdvault-plug@.service" <<EOF
+[Unit]
+Description=SSDVault backup of plugged-in drive %I
+
+[Service]
+Type=oneshot
+ExecStart=$BIN run --reason plug --device /dev/%I
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
+EOF
+  write_unit "$UNIT_DIR/ssdvault-scan.service" <<EOF
+[Unit]
+Description=SSDVault periodic backup of connected drives
+
+[Service]
+Type=oneshot
+ExecStart=$BIN run --reason timer
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
+EOF
+  write_unit "$UNIT_DIR/ssdvault-scan.timer" <<'EOF'
+[Unit]
+Description=SSDVault periodic backup of connected drives
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=30min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
+  write_unit "$UDEV_RULE" <<'EOF'
+# SSDVault: when a USB filesystem appears, look for a .ssdvault marker on it and back it up.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ssdvault-plug@%k.service"
+EOF
+  systemctl daemon-reload
+  systemctl enable --now ssdvault-scan.timer
+  udevadm control --reload-rules
+
+  log "installed: $BIN, repositories in $repo_root, restic $("$RESTIC" version | awk '{print $2; exit}')"
+  echo "Next: plug the drive in and run: sudo ssdvault register MOUNTPOINT"
+}
+
+cmd_uninstall() {
+  need_root
+  systemctl disable --now ssdvault-scan.timer 2> /dev/null || true
+  systemctl stop 'ssdvault-plug@*.service' ssdvault-scan.service 2> /dev/null || true
+  rm -f "$UNIT_DIR/ssdvault-plug@.service" "$UNIT_DIR/ssdvault-scan.service" "$UNIT_DIR/ssdvault-scan.timer" "$UDEV_RULE"
+  systemctl daemon-reload
+  udevadm control --reload-rules
+  rm -f "$BIN"
+  log "triggers removed. Kept: $CONF_DIR (repository passwords), $LIB_DIR and the repositories in $REPO_ROOT"
+}
+
+cmd=${1:-help}
+shift || true
+case $cmd in
+  install) cmd_install "$@" ;;
+  register) cmd_register "$@" ;;
+  run) cmd_run "$@" ;;
+  status) cmd_status ;;
+  log) journalctl -u 'ssdvault-*' -n "${1:-80}" --no-pager ;;
+  restic) cmd_restic "$@" ;;
+  stop) need_root; systemctl stop 'ssdvault-plug@*.service' ssdvault-scan.service; log "running backups stopped" ;;
+  uninstall) cmd_uninstall ;;
+  help | -h | --help) usage ;;
+  *) usage; exit 2 ;;
+esac

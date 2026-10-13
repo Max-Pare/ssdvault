@@ -1,0 +1,3 @@
+# LF everywhere, also in Windows checkouts with core.autocrlf=true: the Linux script breaks
+# under bash with CRLF, and Windows PowerShell 5.1 reads LF scripts fine.
+* text=auto eol=lf
