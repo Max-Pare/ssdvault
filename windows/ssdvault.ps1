@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Massimo Parenti - https://github.com/Max-Pare/ssdvault
+
 <#
 SSDVault (Windows) - versioned, encrypted backup of a portable SSD to the local disk of
 every PC it gets plugged into. Runs on the built-in Windows PowerShell 5.1.

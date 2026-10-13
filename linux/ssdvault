@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Massimo Parenti - https://github.com/Max-Pare/ssdvault
+#
 # SSDVault (Linux) - versioned, encrypted backup of a portable SSD to the local disk of
 # every PC it gets plugged into. Arch, Debian or any other systemd distro.
 #
